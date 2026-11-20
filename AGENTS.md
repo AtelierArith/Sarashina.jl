@@ -83,6 +83,8 @@ Sarashina.jl は Sarashina API (https://docs.sarashina.ai/) 向けの Julia ク�
 - ASR の `keywords` は JSON 配列文字列で送る。TTS 出力は 24kHz、ASR 入力は 16kHz 必須なので、TTS→ASR の往復にはリサンプルが要る(`test/runtests.jl` の `resample_wav_16k` 参照)。
 - Guard は `chat` 経由で、応答は `安全` または `有害\nT8, T9` 形式。`tools`/`tool_choice` は不可。
 - `reasoning_effort` は思考モデルのみ(非思考モデルに指定すると 400)。
+- `HTTP.request` には必ず `retry = false` を渡す。HTTP.jl 自身のリトライ(冪等な GET は 429 でも最大 4 回)が `Retry-After` を無視し、`Sarashina._request` の再試行と二重になる(モックテストで判明: 想定 3 回のところ 15 回リクエストしていた)。429 は `_request` だけで処理する。
+- `test/mock_tests.jl` は `HTTP.serve!` のローカルモックサーバーで、リクエスト/レスポンス形式・SSE・multipart・429 リトライを検証する。サーバー起動後に定義した応答関数を呼ぶため `Base.invokelatest` が必要(world age エラー回避)。リクエストごとの本文は `REQUESTS` に記録される。
 - 実 API テストは `Pkg.test()` だとカレントが違い `.env` が見つからずスキップされる。プロジェクトルートから `julia --project=. -e 'using Test; include("test/runtests.jl")'` で実行する。TTS/Guard は 6 RPM なので連続実行に注意。
 
 ## ドキュメントの既知の不整合
