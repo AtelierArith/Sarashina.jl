@@ -79,7 +79,7 @@ transcribe(c, "audio.wav"; keywords = ["Sarashina"])   # WAV: 16kHz・16bit PCM�
 ## 補足
 
 - **レート制限**: モデルごとの RPM 制限があります(guard / TTS は 6、mini / thinking / translate / ASR は 30、nano / embedding / rerank は 60)。
-  `429` のときは `Retry-After` に従って自動で再試行します(`Client(max_retries = 3)` で回数を変更)。
+  `429` のときは `Retry-After` に従って、`500`/`502`/`503`/`504` のときは指数バックオフで自動的に再試行します(`Client(max_retries = 3)` で回数を変更)。`Client(read_idle_timeout = 120)` で無通信タイムアウト(秒)を指定できます。
 - **エラー**: 2xx 以外は `SarashinaError(status, message)` を投げます。
 - **TTS と ASR のサンプルレート**: TTS 出力は 24kHz、ASR 入力は 16kHz が必須です。
 - 料金や最大出力トークン数など、ドキュメントに記載がない情報は扱っていません。
@@ -90,7 +90,7 @@ transcribe(c, "audio.wav"; keywords = ["Sarashina"])   # WAV: 16kHz・16bit PCM�
 julia --project=. -e 'using Pkg; Pkg.test()'
 ```
 
-- オフライン: 引数検証、ローカルのモックサーバーによるリクエスト/レスポンス形式・SSE・multipart・429 リトライの検証。
+- オフライン: 引数検証、ローカルのモックサーバーによるリクエスト/レスポンス形式・SSE・multipart・429/5xx リトライ・タイムアウトの検証。
 - 実 API: `SARASHINA_API_KEY` がある場合のみ実行されます。`.env` を読ませるため、プロジェクトルートから
   `julia --project=. -e 'using Test; include("test/runtests.jl")'` で実行してください(TTS / Guard は 6 RPM に注意)。
 
