@@ -215,9 +215,52 @@ client = Client(api_key = "test-key", base_url = "http://127.0.0.1:$port/", max_
             @test err.status == 401 && err.message == "invalid api key"
             @test occursin("401", sprint(showerror, err))
         end
-        with_mock(req -> HTTP.Response(500, "plain text failure")) do
+        with_mock(req -> HTTP.Response(400, "plain text failure")) do
             err = try list_models(client); nothing catch e; e end
-            @test err isa SarashinaError && err.status == 500 && err.message == "plain text failure"
+            @test err isa SarashinaError && err.status == 400 && err.message == "plain text failure"
+            @test length(REQUESTS) == 1          # 4xx other than 429 is not retried
+        end
+    end
+
+    @testset "error hints" begin
+        e401 = sprint(showerror, SarashinaError(401, "Unauthorized"))
+        @test occursin("SARASHINA_API_KEY", e401)
+        @test occursin("outside Japan", sprint(showerror, SarashinaError(403, "Forbidden")))
+        @test !occursin("\n", sprint(showerror, SarashinaError(400, "Bad request")))
+    end
+
+    @testset "retry on 5xx" begin
+        c1 = Client(api_key = "test-key", base_url = "http://127.0.0.1:$port", max_retries = 1)
+        calls = Ref(0)
+        responder = req -> begin
+            calls[] += 1
+            calls[] < 2 ? HTTP.Response(503, "unavailable") :
+                          json_response(Dict("data" => [Dict("id" => "sarashina3-nano")]))
+        end
+        with_mock(responder) do
+            t = @elapsed ids = list_models(c1)
+            @test ids == ["sarashina3-nano"]
+            @test calls[] == 2
+            @test t >= 1.0                       # backed off 2^0 = 1 s
+        end
+
+        calls[] = 0
+        with_mock(req -> (calls[] += 1; HTTP.Response(500, "boom"))) do
+            err = try list_models(c1); nothing catch e; e end
+            @test err isa SarashinaError && err.status == 500 && err.message == "boom"
+            @test calls[] == 2                   # 1 try + max_retries(1)
+        end
+    end
+
+    @testset "read_idle_timeout" begin
+        @test client.read_idle_timeout === nothing
+        c = Client(api_key = "test-key", base_url = "http://127.0.0.1:$port", max_retries = 0, read_idle_timeout = 1)
+        @test c.read_idle_timeout == 1
+        with_mock(req -> (sleep(3); json_response(Dict("data" => [])))) do
+            @test_throws Exception list_models(c)
+        end
+        with_mock(req -> json_response(Dict("data" => [Dict("id" => "x")]))) do
+            @test list_models(c) == ["x"]
         end
     end
 

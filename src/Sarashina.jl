@@ -40,6 +40,9 @@ const TTS_VOICES = ("ja_f_1", "ja_f_2", "ja_m_1")
 const TTS_FORMATS = ("wav", "pcm", "flac", "mp3", "opus")
 const ASR_FORMATS = ("json", "text", "verbose_json")
 const REASONING_EFFORTS = ("low", "medium", "high")
+const RETRY_SERVER_ERRORS = (500, 502, 503, 504)
+const MAX_RETRY_AFTER = 120   # seconds; upper bound for honoring `Retry-After`
+const MAX_BACKOFF = 30.0      # seconds; upper bound for the 5xx exponential backoff
 
 # ---------------------------------------------------------------------------
 # Client / errors
@@ -54,27 +57,43 @@ struct SarashinaError <: Exception
     status::Int
     message::String
 end
-Base.showerror(io::IO, e::SarashinaError) =
+function Base.showerror(io::IO, e::SarashinaError)
     print(io, "SarashinaError(", e.status, "): ", e.message)
+    if e.status == 401
+        print(io, "\nCheck that SARASHINA_API_KEY holds a valid API key ",
+            "(issue one at https://chat.sarashina.ai/dashboard/api-keys).")
+    elseif e.status == 403
+        print(io, "\nThe Sarashina API rejects access from outside Japan.")
+    end
+end
 
 """
-    Client(; api_key, base_url, max_retries)
+    Client(; api_key, base_url, max_retries, read_idle_timeout)
 
 API client. `api_key` defaults to `ENV["SARASHINA_API_KEY"]`, falling back to a `.env` file
-loaded with DotEnv.jl. On `429`, requests are retried up to `max_retries` times, waiting for
-the number of seconds in the `Retry-After` header.
+loaded with DotEnv.jl.
+
+Requests are retried up to `max_retries` times on `429` (waiting for the number of seconds in
+the `Retry-After` header, at most $(MAX_RETRY_AFTER) s) and on `500`/`502`/`503`/`504`
+(exponential backoff: 1, 2, 4, ... up to $(MAX_BACKOFF) s).
+
+`read_idle_timeout` is the number of seconds without incoming data after which a request
+fails; `nothing` (the default) leaves it to HTTP.jl.
 """
 struct Client
     api_key::String
     base_url::String
     max_retries::Int
+    read_idle_timeout::Union{Nothing,Int}
 end
 
 function Client(; api_key::Union{Nothing,AbstractString} = nothing,
                   base_url::AbstractString = DEFAULT_BASE_URL,
-                  max_retries::Integer = 3)
+                  max_retries::Integer = 3,
+                  read_idle_timeout::Union{Nothing,Integer} = nothing)
     key = api_key === nothing ? _load_api_key() : String(api_key)
-    return Client(key, rstrip(String(base_url), '/'), Int(max_retries))
+    timeout = read_idle_timeout === nothing ? nothing : Int(read_idle_timeout)
+    return Client(key, rstrip(String(base_url), '/'), Int(max_retries), timeout)
 end
 
 Base.show(io::IO, c::Client) = print(io, "Client(base_url=", c.base_url, ", api_key=***)")
@@ -104,17 +123,30 @@ function _error_message(body::AbstractVector{UInt8})
     return s
 end
 
-# Send a request, retrying on 429 according to Retry-After.
+# Seconds to wait before retrying `resp` (a retryable response), or `nothing` if it is not retryable.
+function _retry_delay(resp, attempt::Int)
+    if resp.status == 429
+        s = something(tryparse(Int, strip(HTTP.header(resp, "Retry-After", "1"))), 1)
+        return clamp(s, 1, MAX_RETRY_AFTER)
+    elseif resp.status in RETRY_SERVER_ERRORS
+        return min(2.0^attempt, MAX_BACKOFF)
+    end
+    return nothing
+end
+
+# Send a request, retrying on 429 (Retry-After) and transient 5xx (exponential backoff).
 function _request(c::Client, method::String, path::String, body, headers)
     url = c.base_url * path
+    opts = c.read_idle_timeout === nothing ? (;) : (; read_idle_timeout = c.read_idle_timeout)
     attempt = 0
     while true
-        # retry = false: HTTP.jl's own retry would ignore Retry-After; we handle 429 ourselves.
-        resp = HTTP.request(method, url, headers, body; status_exception = false, retry = false)
-        if resp.status == 429 && attempt < c.max_retries
+        # retry = false: HTTP.jl's own retry would ignore Retry-After; we handle retries ourselves.
+        resp = HTTP.request(method, url, headers, body; status_exception = false, retry = false, opts...)
+        delay = _retry_delay(resp, attempt)
+        if delay !== nothing && attempt < c.max_retries
+            @debug "Sarashina API returned $(resp.status); retrying in $(delay) s" attempt
             attempt += 1
-            wait_s = something(tryparse(Int, HTTP.header(resp, "Retry-After", "1")), 1)
-            sleep(max(wait_s, 1))
+            sleep(delay)
             continue
         end
         200 <= resp.status < 300 || throw(SarashinaError(resp.status, _error_message(resp.body)))
@@ -185,8 +217,9 @@ function chat_stream(f, c::Client, messages; model::AbstractString = MODELS.mini
     payload = _chat_payload(model, messages; reasoning_effort, kwargs...)
     payload["stream"] = true
     out = IOBuffer()
+    opts = c.read_idle_timeout === nothing ? (;) : (; read_idle_timeout = c.read_idle_timeout)
     HTTP.open("POST", c.base_url * "/v1/chat/completions", _headers(c);
-              status_exception = false) do io
+              status_exception = false, opts...) do io
         write(io, JSON.json(payload))
         HTTP.closewrite(io)
         resp = HTTP.startread(io)
