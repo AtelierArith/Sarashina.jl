@@ -84,6 +84,34 @@ speak(c, "こんにちは。"; voice = "ja_f_1", response_format = "wav", path =
 transcribe(c, "hello.wav"; keywords = ["Sarashina"])
 ```
 
+## API 一覧
+
+エクスポートされている名前:`Client`, `SarashinaError`, `chat`, `chat_stream`, `content`,
+`guard`, `embed`, `rerank`, `translate`, `transcribe`, `speak`, `list_models`, `MODELS`。
+
+| 関数・型 | シグネチャ | 戻り値 |
+|---|---|---|
+| `Client` | `Client(; api_key=nothing, base_url="https://api.sarashina.ai", max_retries=3, read_idle_timeout=nothing)` | API クライアント。`api_key` は `ENV` → `.env` の順で解決 |
+| `SarashinaError` | 2xx 以外のときに送出。`status::Int` と `message::String` を持つ | — |
+| `chat` | `chat(client, messages; model=MODELS.mini_thinking, reasoning_effort=nothing, kwargs...)` | 応答 `Dict`(本文は `content`) |
+| `chat_stream` | `chat_stream(f, client, messages; kwargs...)` / `chat_stream(client, messages; kwargs...)` / `do chunk ... end` | `delta.content` を連結した `String` |
+| `content` | `content(resp)` | 最初の choice の本文 `String` |
+| `guard` | `guard(client, text; role="user", kwargs...)` | `(safe::Bool, categories::Vector{String}, raw::String)` |
+| `embed` | `embed(client, text; task_type, model=MODELS.embedding)` | 1536 次元 `Vector{Float64}` |
+| `rerank` | `rerank(client, query, documents; task_type="GENERAL_RETRIEVAL", query_instruction=nothing, model=MODELS.rerank)` | `[(document_id = ..., score = ...), ...]`(1 始まり、score 降順) |
+| `translate` | `translate(client, text; source_lang, target_lang, style=nothing)` | 翻訳文 `String` |
+| `transcribe` | `transcribe(client, wav; model=MODELS.asr, response_format="json", keywords=nothing, biasing_threshold=nothing)` | `json`/`text` は `String`、`verbose_json` は `Dict` |
+| `speak` | `speak(client, text; voice="ja_f_1", response_format="wav", speed=nothing, seed=nothing, path=nothing, model=MODELS.tts)` | 音声バイト列、`path` 指定時は保存先パス |
+| `list_models` | `list_models(client)` | `Vector{String}` |
+| `MODELS` | `MODELS.nano` などの名前付きタプル | モデル ID の `String` |
+
+- `messages` は文字列(ユーザー発話)か `[Dict("role" => "...", "content" => "..."), ...]`。
+- `chat` / `guard` の追加キーワード(`temperature`, `max_completion_tokens`, `tools`, `tool_choice`, `response_format` など)はリクエストボディにそのまま渡ります。
+- `embed` の `task_type` は `RETRIEVAL_DOCUMENT`, `RETRIEVAL_QUERY`, `SEMANTIC_SIMILARITY`, `QUESTION_ANSWERING`, `FACT_VERIFICATION`, `CLASSIFICATION`, `CLUSTERING` のいずれか(必須)。
+- `rerank` の `task_type` は `GENERAL_RETRIEVAL`, `GENERAL_QA`, `NEWS_RETRIEVAL`, `SEMANTIC_SIMILARITY`, `CUSTOMIZE` のいずれか(`CUSTOMIZE` は `query_instruction` 必須)。
+- `speak` の `voice` は `ja_f_1`, `ja_f_2`, `ja_m_1`、`response_format` は `wav`, `pcm`, `flac`, `mp3`, `opus`。
+- `transcribe` の `wav` はパスでもバイト列でも可。16kHz・16bit PCM・モノラル以外は自動変換されます。
+
 ## 補足
 
 - **レート制限**: モデルごとの RPM 制限があります(guard / TTS は 6、mini / thinking / translate / ASR は 30、nano / embedding / rerank は 60)。
