@@ -32,25 +32,45 @@ using Sarashina: _parse_guard, MODELS
     @test !occursin("dummy", sprint(show, c))
 end
 
-include("mock_tests.jl")
-
-# Convert a 24 kHz 16-bit mono WAV (as produced by `speak`) to 16 kHz by linear interpolation.
-function resample_wav_16k(wav::Vector{UInt8}; from = 24_000, to = 16_000)
-    pcm = reinterpret(Int16, wav[45:end - (length(wav) - 44) % 2])
-    n = floor(Int, length(pcm) * to / from)
-    out = Vector{Int16}(undef, n)
-    for i in 1:n
-        x = (i - 1) * from / to + 1
-        lo = floor(Int, x); hi = min(lo + 1, length(pcm)); f = x - lo
-        out[i] = round(Int16, (1 - f) * pcm[lo] + f * pcm[hi])
-    end
-    data = collect(reinterpret(UInt8, out))
+# Build a 16-bit PCM WAV in memory (0.5 s, 440 Hz sine unless `seconds` is given).
+function make_pcm16_wav(rate::Int; channels::Int = 1, seconds = 0.5)
+    frames = round(Int, rate * seconds)
+    samples = Int16[round(Int16, 10_000 * sin(2π * 440 * i / rate)) for i in 0:frames - 1]
+    pcm = repeat(samples, inner = channels)
+    data = collect(reinterpret(UInt8, pcm))
     io = IOBuffer()
     write(io, b"RIFF", UInt32(36 + length(data)), b"WAVE", b"fmt ", UInt32(16),
-          UInt16(1), UInt16(1), UInt32(to), UInt32(to * 2), UInt16(2), UInt16(16),
-          b"data", UInt32(length(data)), data)
+          UInt16(1), UInt16(channels), UInt32(rate), UInt32(rate * 2 * channels),
+          UInt16(2 * channels), UInt16(16), b"data", UInt32(length(data)), data)
     return take!(io)
 end
+
+@testset "WAV conversion for ASR" begin
+    wav24 = make_pcm16_wav(24_000)
+    out = Sarashina._to_asr_wav(wav24)
+    info = Sarashina._wav_info(out)
+    @test info.sample_rate == 16_000
+    @test info.channels == 1
+    @test info.bits_per_sample == 16
+    @test info.audio_format == 1
+    @test info.data_length == 2 * 8_000          # 0.5 s at 16 kHz
+    @test length(out) == 44 + info.data_length
+
+    wav16 = make_pcm16_wav(16_000)
+    @test Sarashina._to_asr_wav(wav16) === wav16  # already 16 kHz/16-bit/mono: returned untouched
+
+    o2 = Sarashina._to_asr_wav(make_pcm16_wav(16_000; channels = 2))
+    @test Sarashina._wav_info(o2).channels == 1
+    @test Sarashina._wav_info(o2).sample_rate == 16_000
+
+    o3 = Sarashina._to_asr_wav(make_pcm16_wav(8_000))
+    @test Sarashina._wav_info(o3).sample_rate == 16_000
+    @test Sarashina._wav_info(o3).data_length == 2 * 8_000
+
+    @test Sarashina._to_asr_wav(UInt8[1, 2, 3]) == UInt8[1, 2, 3]   # not a WAV: passed through
+end
+
+include("mock_tests.jl")
 
 # Live API tests: run only when a key is available. Mind per-model RPM (TTS/Guard: 6).
 using DotEnv
@@ -64,8 +84,19 @@ if HAS_KEY
         r = chat(c, "1+1は？ 数字だけ答えて。"; model = MODELS.nano, max_completion_tokens = 16)
         @test !isempty(content(r))
 
-        t = chat_stream(c, "こんにちは"; model = MODELS.nano, max_completion_tokens = 16)
+        chunks = Any[]
+        t = chat_stream(c, "こんにちは"; model = MODELS.nano, max_completion_tokens = 16) do chunk
+            push!(chunks, chunk)
+        end
         @test !isempty(t)
+        @test all(ch -> ch isa AbstractDict, chunks)
+        # The return value is the concatenation of delta.content; the usage-only final chunk
+        # (choices == []) must not break the stream.
+        deltas = String[ch["choices"][1]["delta"]["content"] for ch in chunks
+                        if !isempty(ch["choices"]) &&
+                           get(ch["choices"][1]["delta"], "content", nothing) isa AbstractString]
+        @test t == join(deltas)
+        @test !isempty(chat_stream(c, "こんにちは"; model = MODELS.nano, max_completion_tokens = 16))
 
         r = chat(c, "2+3は？"; model = MODELS.mini_thinking, reasoning_effort = "low")
         @test !isempty(content(r))
@@ -84,7 +115,7 @@ if HAS_KEY
         audio = speak(c, "こんにちは。"; response_format = "wav")
         @test length(audio) > 44
         @test String(audio[1:4]) == "RIFF"
-        txt = transcribe(c, resample_wav_16k(audio))   # TTS is 24 kHz; ASR requires 16 kHz
+        txt = transcribe(c, audio)   # TTS returns 24 kHz; transcribe converts it to 16 kHz
         @test txt isa String
         @test !isempty(txt)
     end

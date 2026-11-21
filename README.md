@@ -78,36 +78,19 @@ rerank(c, "日本の首都は？", ["東京は日本の首都です。", "犬は
 # 翻訳 (日英・英日)
 translate(c, "The results will be published next week."; source_lang = "en", target_lang = "ja", style = "polite")
 
-# 24kHz の 16bit PCM モノラル WAV を 16kHz に線形補間で変換する補助関数
-function resample_wav_16k(wav::Vector{UInt8}; from = 24_000, to = 16_000)
-    pcm = reinterpret(Int16, wav[45:end - (length(wav) - 44) % 2])
-    n = floor(Int, length(pcm) * to / from)
-    out = Vector{Int16}(undef, n)
-    for i in 1:n
-        x = (i - 1) * from / to + 1
-        lo = floor(Int, x); hi = min(lo + 1, length(pcm)); f = x - lo
-        out[i] = round(Int16, (1 - f) * pcm[lo] + f * pcm[hi])
-    end
-    data = collect(reinterpret(UInt8, out))
-    io = IOBuffer()
-    write(io, b"RIFF", UInt32(36 + length(data)), b"WAVE", b"fmt ", UInt32(16),
-          UInt16(1), UInt16(1), UInt32(to), UInt32(to * 2), UInt16(2), UInt16(16),
-          b"data", UInt32(length(data)), data)
-    return take!(io)
-end
-
 # 音声合成 / 音声認識
+# TTS の出力は 24kHz だが、transcribe が 16kHz・16bit PCM・モノラルに自動変換する
 speak(c, "こんにちは。"; voice = "ja_f_1", response_format = "wav", path = "hello.wav")
-# TTS の出力は 24kHz、ASR の入力は 16kHz が必須なので変換してから渡す
-transcribe(c, resample_wav_16k(read("hello.wav")); keywords = ["Sarashina"])
+transcribe(c, "hello.wav"; keywords = ["Sarashina"])
 ```
 
 ## 補足
 
 - **レート制限**: モデルごとの RPM 制限があります(guard / TTS は 6、mini / thinking / translate / ASR は 30、nano / embedding / rerank は 60)。
   `429` のときは `Retry-After` に従って、`500`/`502`/`503`/`504` のときは指数バックオフで自動的に再試行します(`Client(max_retries = 3)` で回数を変更)。`Client(read_idle_timeout = 120)` で無通信タイムアウト(秒)を指定できます。
+  ただし `chat_stream`(SSE)は再試行の対象外です。再試行が必要な場合は呼び出し側で処理してください。
 - **エラー**: 2xx 以外は `SarashinaError(status, message)` を投げます。
-- **TTS と ASR のサンプルレート**: TTS 出力は 24kHz、ASR 入力は 16kHz が必須です。
+- **TTS と ASR のサンプルレート**: TTS 出力は 24kHz、ASR 入力は 16kHz・16bit PCM・モノラルが必須です。`transcribe` は 24kHz やステレオ、8/24/32bit PCM、32bit float の WAV を自動で 16kHz・16bit PCM・モノラルに変換します(線形補間)。
 - 料金や最大出力トークン数など、ドキュメントに記載がない情報は扱っていません。
 
 ## テスト

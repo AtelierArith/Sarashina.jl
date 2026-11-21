@@ -87,11 +87,34 @@ client = Client(api_key = "test-key", base_url = "http://127.0.0.1:$port/", max_
             text = chat_stream(chunk -> push!(chunks, chunk), client, "hi"; model = MODELS.nano)
             @test text == "こんにちは"
             @test length(chunks) == 4
+            @test all(ch -> ch isa Dict{String,Any}, chunks)
+            @test chunks[end]["choices"] == Any[]   # usage-only chunk is delivered but adds no text
+            @test haskey(chunks[end], "usage")
             @test last_json()["stream"] == true   # body is captured per request
+        end
+        # CRLF line endings and comments/blank lines must be tolerated
+        sse_crlf = join([
+            ": keep-alive",
+            "data: " * JSON.json(Dict("choices" => [Dict("index" => 0, "delta" => Dict("content" => "OK"))])),
+            "data: [DONE]", ""], "\r\n\r\n")
+        with_mock(req -> HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse_crlf)) do
+            @test chat_stream(client, "hi"; model = MODELS.nano) == "OK"   # no do-block: identity
+        end
+        # a stream with no content deltas returns an empty String
+        sse_empty = join(["data: " * JSON.json(Dict("choices" => [], "usage" => Dict("total_tokens" => 1))),
+                          "data: [DONE]", ""], "\n\n")
+        with_mock(req -> HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse_empty)) do
+            @test chat_stream(client, "hi"; model = MODELS.nano) == ""
         end
         with_mock(req -> json_response(Dict("message" => "bad"); status = 400)) do
             err = try chat_stream(client, "hi"); nothing catch e; e end
             @test err isa SarashinaError && err.status == 400 && err.message == "bad"
+        end
+        # documented behavior: streaming is not retried, so a 429 yields exactly one request
+        with_mock(req -> HTTP.Response(429, ["Retry-After" => "1"], "{}")) do
+            err = try chat_stream(client, "hi"); nothing catch e; e end
+            @test err isa SarashinaError && err.status == 429
+            @test length(REQUESTS) == 1
         end
     end
 

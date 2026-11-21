@@ -80,7 +80,7 @@ Sarashina.jl は Sarashina API (https://docs.sarashina.ai/) 向けの Julia ク�
 ## 実装メモ
 
 - リクエストのフィールド名はリファレンスで確認済み: translate は `text` → 応答 `translated_text`、embeddings は `data[1].embedding`、rerank は `data[1].result[]`(`document_id` は 0 始まり、`Sarashina.rerank` は 1 始まりに変換)、ASR は `text`(`verbose_json` で `language`/`duration`)。
-- ASR の `keywords` は JSON 配列文字列で送る。TTS 出力は 24kHz、ASR 入力は 16kHz 必須なので、TTS→ASR の往復にはリサンプルが要る(`test/runtests.jl` の `resample_wav_16k` 参照)。
+- ASR の `keywords` は JSON 配列文字列で送る。TTS 出力は 24kHz、ASR 入力は 16kHz・16bit PCM・モノラル必須だが、`transcribe` が WAV ヘッダを読んで自動変換する(`_to_asr_wav`。16kHz/16bit/モノラルの PCM はそのまま送る。非 WAV や解析できない形式はそのまま送って API のエラーに任せる)。
 - Guard は `chat` 経由で、応答は `安全` または `有害\nT8, T9` 形式。`tools`/`tool_choice` は不可。
 - `reasoning_effort` は思考モデルのみ(非思考モデルに指定すると 400)。
 - `HTTP.request` には必ず `retry = false` を渡す。HTTP.jl 自身のリトライ(冪等な GET は 429 でも最大 4 回)が `Retry-After` を無視し、`Sarashina._request` の再試行と二重になる(モックテストで判明: 想定 3 回のところ 15 回リクエストしていた)。429 と 5xx は `_request` だけで処理する。

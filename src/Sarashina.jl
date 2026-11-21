@@ -75,7 +75,8 @@ loaded with DotEnv.jl.
 
 Requests are retried up to `max_retries` times on `429` (waiting for the number of seconds in
 the `Retry-After` header, at most $(MAX_RETRY_AFTER) s) and on `500`/`502`/`503`/`504`
-(exponential backoff: 1, 2, 4, ... up to $(MAX_BACKOFF) s).
+(exponential backoff: 1, 2, 4, ... up to $(MAX_BACKOFF) s). Streaming (`chat_stream`) is not
+retried; handle retries there in the caller.
 
 `read_idle_timeout` is the number of seconds without incoming data after which a request
 fails; `nothing` (the default) leaves it to HTTP.jl.
@@ -210,7 +211,8 @@ end
     chat_stream(f, client, messages; model, reasoning_effort, kwargs...)
 
 Streaming chat (`stream=true`, Server-Sent Events). `f` is called with each parsed chunk
-`Dict`. Returns the concatenated `delta.content` text.
+`Dict`. Returns the concatenated `delta.content` text. Unlike the non-streaming functions,
+`chat_stream` does not retry on `429`/`5xx`.
 """
 function chat_stream(f, c::Client, messages; model::AbstractString = MODELS.mini_thinking,
                      reasoning_effort = nothing, kwargs...)
@@ -365,6 +367,133 @@ function translate(c::Client, text::AbstractString; source_lang::AbstractString,
 end
 
 # ---------------------------------------------------------------------------
+# WAV conversion for ASR (any WAV -> 16 kHz, 16-bit PCM, mono)
+# ---------------------------------------------------------------------------
+
+const ASR_SAMPLE_RATE = 16_000
+
+_u16(b, i) = Int(b[i]) | (Int(b[i + 1]) << 8)
+_u32(b, i) = Int(b[i]) | (Int(b[i + 1]) << 8) | (Int(b[i + 2]) << 16) | (Int(b[i + 3]) << 24)
+
+struct _WavInfo
+    audio_format::Int     # 1 = PCM, 3 = IEEE float
+    channels::Int
+    sample_rate::Int
+    bits_per_sample::Int
+    data_offset::Int      # 1-based index of the first sample byte
+    data_length::Int
+end
+
+# Parse a RIFF/WAVE header, or return `nothing` when `bytes` is not a WAV we understand.
+function _wav_info(bytes::AbstractVector{UInt8})
+    n = length(bytes)
+    (n >= 44 && String(bytes[1:4]) == "RIFF" && String(bytes[9:12]) == "WAVE") || return nothing
+    fmt = nothing
+    data = nothing
+    pos = 13
+    while pos + 7 <= n
+        id = String(bytes[pos:pos + 3])
+        len = _u32(bytes, pos + 4)
+        start = pos + 8
+        avail = n - start + 1
+        if id == "fmt "
+            (len >= 16 && avail >= 16) || return nothing
+            fmt = (format = _u16(bytes, start), channels = _u16(bytes, start + 2),
+                   rate = _u32(bytes, start + 4), bits = _u16(bytes, start + 14))
+        elseif id == "data"
+            data = (start = start, len = max(min(len, avail), 0))
+        end
+        pos = start + len + isodd(len)   # chunks are padded to an even number of bytes
+    end
+    (fmt === nothing || data === nothing) && return nothing
+    return _WavInfo(fmt.format, fmt.channels, fmt.rate, fmt.bits, data.start, data.len)
+end
+
+# Decode one sample to Float64 in [-1, 1]. `o` is the 1-based offset of its first byte.
+function _wav_sample(b, o::Int, fmt::Int, bits::Int)
+    if fmt == 3
+        return Float64(reinterpret(Float32, UInt32(b[o]) | (UInt32(b[o + 1]) << 8) |
+                                             (UInt32(b[o + 2]) << 16) | (UInt32(b[o + 3]) << 24)))
+    elseif bits == 8
+        return (Int(b[o]) - 128) / 128
+    elseif bits == 16
+        return reinterpret(Int16, UInt16(b[o]) | (UInt16(b[o + 1]) << 8)) / 32768
+    elseif bits == 24
+        v = Int32(b[o]) | (Int32(b[o + 1]) << 8) | (Int32(b[o + 2]) << 16)
+        return ((v << 8) >> 8) / 8388608
+    else   # 32-bit PCM
+        return reinterpret(Int32, UInt32(b[o]) | (UInt32(b[o + 1]) << 8) |
+                                     (UInt32(b[o + 2]) << 16) | (UInt32(b[o + 3]) << 24)) / 2147483648
+    end
+end
+
+# Mono Float64 samples averaged over channels, or `nothing` for an unsupported format.
+function _wav_samples(bytes::AbstractVector{UInt8}, info::_WavInfo)
+    bits = info.bits_per_sample
+    fmt = info.audio_format
+    ((fmt == 1 && bits in (8, 16, 24, 32)) || (fmt == 3 && bits == 32)) || return nothing
+    info.channels >= 1 || return nothing
+    width = bits ÷ 8
+    frames = info.data_length ÷ (width * info.channels)
+    out = Vector{Float64}(undef, frames)
+    o = info.data_offset
+    for i in 1:frames
+        acc = 0.0
+        for _ in 1:info.channels
+            acc += _wav_sample(bytes, o, fmt, bits)
+            o += width
+        end
+        out[i] = acc / info.channels
+    end
+    return out
+end
+
+# Linear-interpolation resampling.
+function _resample(samples::Vector{Float64}, from::Int, to::Int)
+    from == to && return samples
+    n = floor(Int, length(samples) * to / from)
+    out = Vector{Float64}(undef, n)
+    for i in 1:n
+        x = (i - 1) * from / to + 1
+        lo = floor(Int, x)
+        hi = min(lo + 1, length(samples))
+        f = x - lo
+        out[i] = (1 - f) * samples[lo] + f * samples[hi]
+    end
+    return out
+end
+
+function _encode_wav16k(samples::Vector{Float64})
+    pcm = Vector{Int16}(undef, length(samples))
+    for i in eachindex(samples)
+        pcm[i] = round(Int16, clamp(samples[i], -1.0, 1.0) * 32767)
+    end
+    data = collect(reinterpret(UInt8, pcm))
+    io = IOBuffer()
+    write(io, b"RIFF", UInt32(36 + length(data)), b"WAVE", b"fmt ", UInt32(16),
+          UInt16(1), UInt16(1), UInt32(ASR_SAMPLE_RATE), UInt32(ASR_SAMPLE_RATE * 2),
+          UInt16(2), UInt16(16), b"data", UInt32(length(data)), data)
+    return take!(io)
+end
+
+"""
+    _to_asr_wav(bytes) -> Vector{UInt8}
+
+Convert a WAV to the layout the ASR endpoint requires (16 kHz, 16-bit PCM, mono) using linear
+interpolation. Anything that is not a WAV, or whose samples cannot be decoded, is returned as-is
+so the API can report the problem.
+"""
+function _to_asr_wav(bytes::Vector{UInt8})
+    info = _wav_info(bytes)
+    info === nothing && return bytes
+    (info.sample_rate == ASR_SAMPLE_RATE && info.channels == 1 &&
+     info.audio_format == 1 && info.bits_per_sample == 16) && return bytes
+    samples = _wav_samples(bytes, info)
+    samples === nothing && return bytes
+    return _encode_wav16k(_resample(samples, info.sample_rate, ASR_SAMPLE_RATE))
+end
+
+# ---------------------------------------------------------------------------
 # ASR (sarashina3.2-asr)
 # ---------------------------------------------------------------------------
 
@@ -372,15 +501,17 @@ end
     transcribe(client, wav; response_format="json", keywords=nothing, biasing_threshold=nothing)
 
 POST `/v1/audio/transcriptions` (multipart). `wav` is a path or the raw bytes of a WAV file
-(16 kHz, 16-bit PCM, mono, 0.1–60 s, at most 2 MiB). `keywords` (a vector of strings) biases
-recognition toward proper nouns. Returns the transcript `String` for `json` and `text`, or the full `Dict`
+(0.1–60 s, at most 2 MiB after conversion). The API requires 16 kHz, 16-bit PCM, mono; other
+WAV layouts (24 kHz TTS output, stereo, 8/24/32-bit PCM, 32-bit float) are converted
+automatically. `keywords` (a vector of strings) biases recognition toward proper nouns.
+Returns the transcript `String` for `json` and `text`, or the full `Dict`
 (`text`, `language`, `duration`) for `verbose_json`.
 """
 function transcribe(c::Client, wav::Union{AbstractString,AbstractVector{UInt8}};
                     model::AbstractString = MODELS.asr, response_format::AbstractString = "json",
                     keywords = nothing, biasing_threshold = nothing)
     _check_in("response_format", response_format, ASR_FORMATS)
-    bytes = wav isa AbstractString ? read(wav) : wav
+    bytes = _to_asr_wav(Vector{UInt8}(wav isa AbstractString ? read(wav) : wav))
     length(bytes) <= 2 * 1024 * 1024 || throw(ArgumentError("audio must be at most 2 MiB"))
     fields = Pair{String,Any}[
         "file" => HTTP.Multipart("audio.wav", IOBuffer(bytes), "audio/wav"),
