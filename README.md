@@ -56,7 +56,14 @@ chat_stream(c, "自己紹介して"; model = MODELS.nano) do chunk
 end
 
 # Function Calling / Structured Outputs は kwargs でそのまま渡せる
-chat(c, "天気は？"; tools = [...], tool_choice = "auto")
+tools = [Dict("type" => "function",
+              "function" => Dict(
+                  "name" => "get_weather",
+                  "description" => "Get the current weather for a city",
+                  "parameters" => Dict("type" => "object",
+                      "properties" => Dict("city" => Dict("type" => "string")),
+                      "required" => ["city"])))]
+chat(c, "東京の天気は？"; tools = tools, tool_choice = "auto")
 chat(c, "JSON で答えて"; response_format = Dict("type" => "json_object"))
 
 # 安全性判定 -> (safe, categories, raw)
@@ -71,9 +78,28 @@ rerank(c, "日本の首都は？", ["東京は日本の首都です。", "犬は
 # 翻訳 (日英・英日)
 translate(c, "The results will be published next week."; source_lang = "en", target_lang = "ja", style = "polite")
 
+# 24kHz の 16bit PCM モノラル WAV を 16kHz に線形補間で変換する補助関数
+function resample_wav_16k(wav::Vector{UInt8}; from = 24_000, to = 16_000)
+    pcm = reinterpret(Int16, wav[45:end - (length(wav) - 44) % 2])
+    n = floor(Int, length(pcm) * to / from)
+    out = Vector{Int16}(undef, n)
+    for i in 1:n
+        x = (i - 1) * from / to + 1
+        lo = floor(Int, x); hi = min(lo + 1, length(pcm)); f = x - lo
+        out[i] = round(Int16, (1 - f) * pcm[lo] + f * pcm[hi])
+    end
+    data = collect(reinterpret(UInt8, out))
+    io = IOBuffer()
+    write(io, b"RIFF", UInt32(36 + length(data)), b"WAVE", b"fmt ", UInt32(16),
+          UInt16(1), UInt16(1), UInt32(to), UInt32(to * 2), UInt16(2), UInt16(16),
+          b"data", UInt32(length(data)), data)
+    return take!(io)
+end
+
 # 音声合成 / 音声認識
 speak(c, "こんにちは。"; voice = "ja_f_1", response_format = "wav", path = "hello.wav")
-transcribe(c, "audio.wav"; keywords = ["Sarashina"])   # WAV: 16kHz・16bit PCM・モノラル、0.1〜60 秒
+# TTS の出力は 24kHz、ASR の入力は 16kHz が必須なので変換してから渡す
+transcribe(c, resample_wav_16k(read("hello.wav")); keywords = ["Sarashina"])
 ```
 
 ## 補足
